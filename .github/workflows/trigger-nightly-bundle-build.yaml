@@ -76,6 +76,77 @@ jobs:
           cosign login registry.redhat.io -u "${REGISTRY_REDHAT_IO_USERNAME}" -p "${REGISTRY_REDHAT_IO_PASSWORD}"
           cosign login registry.stage.redhat.io -u "${REGISTRY_STAGE_REDHAT_IO_USERNAME}" -p "${REGISTRY_STAGE_REDHAT_IO_PASSWORD}"
           cosign login quay.io -u "${RHOAI_QUAY_RO_USERNAME}" -p "${RHOAI_QUAY_RO_TOKEN}"
+      - name: Login to Quay for skopeo
+        env:
+          RHOAI_QUAY_RO_USERNAME: ${{ secrets.RHOAI_QUAY_RO_USERNAME }}
+          RHOAI_QUAY_RO_TOKEN: ${{ secrets.RHOAI_QUAY_RO_TOKEN }}
+        run: |
+          skopeo login -u "${RHOAI_QUAY_RO_USERNAME}" -p "${RHOAI_QUAY_RO_TOKEN}" quay.io
+      - name: Fetch latest operator image
+        run: |
+          # For Nightly: append -nightly to branch name (e.g. rhoai-3.6-nightly)
+          IMAGE_TAG="${GITHUB_REF_NAME}-nightly"
+
+          # Inspect the operator image
+          INSPECT_OUTPUT=$(skopeo inspect docker://quay.io/rhoai/odh-rhel9-operator:${IMAGE_TAG})
+
+          # Extract digest
+          DIGEST=$(echo "${INSPECT_OUTPUT}" | jq -r '.Digest')
+          OPERATOR_IMAGE_REF="quay.io/rhoai/odh-rhel9-operator@${DIGEST}"
+
+          # Extract git metadata from labels
+          GIT_URL=$(echo "${INSPECT_OUTPUT}" | jq -r '.Labels["git.url"] // .Labels["github.url"]')
+          GIT_COMMIT=$(echo "${INSPECT_OUTPUT}" | jq -r '.Labels["git.commit"] // .Labels["github.commit"]')
+
+          if [ -z "${DIGEST}" ] || [ -z "${GIT_URL}" ] || [ -z "${GIT_COMMIT}" ]; then
+            echo "ERROR: Failed to extract required metadata from operator image"
+            echo "  Digest: ${DIGEST}"
+            echo "  Git URL: ${GIT_URL}"
+            echo "  Git commit: ${GIT_COMMIT}"
+            exit 1
+          fi
+
+          # Extract owner/repo for actions/checkout (strip https://github.com/ prefix)
+          OPERATOR_REPO=$(echo "${GIT_URL}" | sed 's|https://github.com/||' | sed 's|/$||')
+
+          echo "Operator image: ${OPERATOR_IMAGE_REF}"
+          echo "Git URL: ${GIT_URL}"
+          echo "Git commit: ${GIT_COMMIT}"
+          echo "Operator repo: ${OPERATOR_REPO}"
+
+          echo "OPERATOR_IMAGE_REF=${OPERATOR_IMAGE_REF}" >> $GITHUB_ENV
+          echo "OPERATOR_GIT_URL=${GIT_URL}" >> $GITHUB_ENV
+          echo "OPERATOR_GIT_COMMIT=${GIT_COMMIT}" >> $GITHUB_ENV
+          echo "OPERATOR_REPO=${OPERATOR_REPO}" >> $GITHUB_ENV
+      - name: Clone rhods-operator at operator image commit
+        uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3
+        with:
+          repository: ${{ env.OPERATOR_REPO }}
+          path: operator_source
+          ref: ${{ env.OPERATOR_GIT_COMMIT }}
+      - name: Set up Go
+        uses: actions/setup-go@0aaccfd150d50ccaeb58ebd88eb36e1752db3df8 # v5
+        with:
+          go-version-file: operator_source/go.mod
+      - name: Generate bundle files
+        run: |
+          cd operator_source
+          ODH_PLATFORM_TYPE=rhoai make bundle
+      - name: Sync generated bundle files
+        env:
+          BRANCH: ${{ steps.get_branch.outputs.branch }}
+        run: |
+          mkdir -p ${BRANCH}/to-be-processed/bundle
+          rm -rf ${BRANCH}/to-be-processed/bundle/*
+          if [ -d operator_source/rhoai-bundle ]; then
+            cp -r operator_source/rhoai-bundle/* ${BRANCH}/to-be-processed/bundle/
+          else
+            cp -r operator_source/bundle/* ${BRANCH}/to-be-processed/bundle/
+          fi
+          sed -i -e "s|image: quay.io/opendatahub/opendatahub-operator:latest.*|image: REPLACE_IMAGE:latest|g" \
+            ${BRANCH}/to-be-processed/bundle/manifests/rhods-operator.clusterserviceversion.yaml
+
+          echo "Bundle generated from operator source commit: ${OPERATOR_GIT_COMMIT}"
       - name: Process Operator Bundle
         env:
           BRANCH: ${{ steps.get_branch.outputs.branch }}
@@ -150,6 +221,7 @@ jobs:
             -y ${BUNDLE_PUSH_PIPELINE_PATH} \
             -x disable \
             -t nightly \
+            --operator-image-ref ${OPERATOR_IMAGE_REF} \
             ${METADATA_CONFIG_FLAG}
 
           cp -r ${RAW_INPUTS_DIR}/* ${BRANCH}/bundle
@@ -177,7 +249,7 @@ jobs:
           git add -A
           PUSH_BRANCH="${{ inputs.dry_run == true && format('{0}-dry-run-nightly-bundle', steps.get_branch.outputs.branch) || steps.get_branch.outputs.branch }}"
           FORCE_FLAG="${{ inputs.dry_run == true && '--force' || '' }}"
-          git diff --staged --quiet || (git commit -m "Updating the bundle-csv and helm chart values with latest images
+          git diff --staged --quiet || (git commit -m "Updating the bundle-csv and helm chart
 
           ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" && git push ${FORCE_FLAG} origin HEAD:${PUSH_BRANCH})
 
